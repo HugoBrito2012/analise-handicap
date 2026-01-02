@@ -3,12 +3,13 @@ import pandas as pd
 import plotly.express as px
 import numpy as np
 import os
+import re
 
 # Configuração da Página
 st.set_page_config(page_title="Sniper HA - Backtest", layout="wide")
 
 # ==============================================================================
-# 1. CARREGAMENTO DE DADOS (CACHEADO)
+# 1. CARREGAMENTO E LIMPEZA (A CORREÇÃO ESTÁ AQUI)
 # ==============================================================================
 @st.cache_data
 def load_data():
@@ -21,6 +22,20 @@ def load_data():
             for c in cols_num:
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors='coerce')
+            
+            # --- CORREÇÃO: NORMALIZAÇÃO DOS NOMES DAS COMPETIÇÕES ---
+            # Remove anos (2021, 2022) e padrões como 21/22 do nome da competição
+            if 'Competicao' in df.columns:
+                def limpar_nome(nome):
+                    # Remove padrões de 4 dígitos (anos) e barras de temporada
+                    nome = str(nome)
+                    nome = re.sub(r'[_ -]?\d{4}', '', nome) # Remove 2021, 2022
+                    nome = re.sub(r'[_ -]?\d{2}/\d{2}', '', nome) # Remove 21/22
+                    return nome.strip('_ -')
+
+                df['Competicao_Original'] = df['Competicao'] # Guarda original por segurança
+                df['Competicao_Grupo'] = df['Competicao'].apply(limpar_nome)
+            
             return df
         except Exception as e:
             st.error(f"Erro ao ler CSV: {e}")
@@ -53,7 +68,7 @@ def calculate_pl(row, side, line_selected):
     else: return -stake / 2                        # Half-Loss
 
 # ==============================================================================
-# 3. INTERFACE E LÓGICA DE ESTADO
+# 3. INTERFACE E CONTROLES
 # ==============================================================================
 st.title("🎯 Sniper HA - Validador de Estratégias")
 
@@ -64,21 +79,23 @@ if df is None:
     st.stop()
 
 # --- SIDEBAR ---
-st.sidebar.header("⚙️ Configuração da Estratégia")
+st.sidebar.header("⚙️ Filtros")
 
-# 1. Competição
-if 'Competicao' in df.columns:
-    ligas = sorted(df['Competicao'].unique().astype(str))
-    liga_sel = st.sidebar.selectbox("Competição", ligas)
-    df_liga = df[df['Competicao'] == liga_sel].copy()
+# 1. Seleção de Competição (USANDO O NOME AGRUPADO)
+if 'Competicao_Grupo' in df.columns:
+    ligas = sorted(df['Competicao_Grupo'].unique())
+    liga_sel = st.sidebar.selectbox("Competição (Agrupada)", ligas)
+    
+    # Filtra usando a coluna limpa
+    df_liga = df[df['Competicao_Grupo'] == liga_sel].copy()
 else:
-    st.error("Coluna 'Competicao' inexistente.")
+    st.error("Erro na coluna de competição.")
     st.stop()
 
 # 2. Lado
 lado_sel = st.sidebar.radio("Apostar em:", ['Mandante', 'Visitante'])
 
-# 3. Lógica de Linhas com MEMÓRIA (Persistência)
+# 3. Seleção de Linha com MEMÓRIA (Persistência)
 available_lines = sorted(df_liga['HA_Line'].dropna().unique())
 
 if lado_sel == 'Visitante':
@@ -90,54 +107,37 @@ if not display_lines:
     st.warning("Sem dados de Handicap para esta liga.")
     st.stop()
 
-# --- ALGORITMO DE PERSISTÊNCIA DA LINHA ---
-# Verifica qual foi a última linha salva na sessão
+# Recupera última linha da memória
 last_line = st.session_state.get('ultima_linha_selecionada', -0.5)
 
-# Tenta encontrar o índice dessa linha na nova lista de linhas da liga atual
+# Tenta achar o índice da última linha na nova lista
 try:
     index_padrao = display_lines.index(last_line)
 except ValueError:
-    # Se a linha antiga não existe nesta liga, tenta achar o -0.5 ou 0.0 como fallback
-    if -0.5 in display_lines:
-        index_padrao = display_lines.index(-0.5)
-    elif 0.0 in display_lines:
-        index_padrao = display_lines.index(0.0)
-    else:
-        index_padrao = 0
+    # Fallback inteligente
+    if -0.5 in display_lines: index_padrao = display_lines.index(-0.5)
+    elif 0.0 in display_lines: index_padrao = display_lines.index(0.0)
+    else: index_padrao = 0
 
-# Cria o widget com o índice calculado
-linha_sel = st.sidebar.selectbox(
-    "Linha de Handicap", 
-    display_lines, 
-    index=index_padrao
-)
+linha_sel = st.sidebar.selectbox("Linha de Handicap", display_lines, index=index_padrao)
 
-# Salva a escolha atual na sessão para a próxima rodada
+# Salva na memória
 st.session_state['ultima_linha_selecionada'] = linha_sel
 
-# --- BOTÃO DE RODAR ---
 st.sidebar.markdown("---")
 btn_rodar = st.sidebar.button("🚀 Rodar Análise", type="primary")
 
 # ==============================================================================
-# 4. PROCESSAMENTO (SÓ RODA SE CLICAR NO BOTÃO)
+# 4. RESULTADOS
 # ==============================================================================
 
-# Usamos session_state para manter o resultado na tela após clicar, 
-# caso contrário, qualquer interação simples poderia sumir com os dados.
 if btn_rodar:
-    st.session_state['mostrar_resultados'] = True
-    st.session_state['params_analise'] = (liga_sel, lado_sel, linha_sel)
+    st.session_state['mostrar'] = True
+    st.session_state['params'] = (liga_sel, lado_sel, linha_sel)
 
-# Verifica se deve mostrar resultados
-if st.session_state.get('mostrar_resultados'):
+if st.session_state.get('mostrar'):
     
-    # Recupera parâmetros que foram "Rodados" (para garantir consistência)
-    # Se o usuário mudar a liga mas não clicar em rodar, os dados velhos continuam ou somem?
-    # Vamos fazer com que mostre os dados ATUAIS selecionados quando o botão foi ativado.
-    
-    # Filtro no DB
+    # Define colunas alvo
     if lado_sel == 'Mandante':
         db_line_target = linha_sel
         odd_col = 'HA_Odd_H'
@@ -145,22 +145,25 @@ if st.session_state.get('mostrar_resultados'):
         db_line_target = linha_sel * -1
         odd_col = 'HA_Odd_A'
 
+    # Filtra os dados
     df_filtrado = df_liga[df_liga['HA_Line'] == db_line_target].copy()
 
     if df_filtrado.empty:
-        st.warning("Nenhum jogo encontrado com esta linha nesta competição.")
+        st.warning("Nenhum jogo encontrado com esta linha.")
     else:
-        # Cálculos
+        # Calcula PL
         df_filtrado['PL'] = df_filtrado.apply(lambda row: calculate_pl(row, lado_sel, linha_sel), axis=1)
         df_filtrado = df_filtrado.dropna(subset=['PL'])
         
+        # Ordenação Cronológica
         if 'Date' in df_filtrado.columns:
             df_filtrado['Date'] = pd.to_datetime(df_filtrado['Date'])
             df_filtrado = df_filtrado.sort_values('Date')
             df_filtrado['Lucro_Acumulado'] = df_filtrado['PL'].cumsum()
 
-        # --- EXIBIÇÃO ---
+        # --- CABEÇALHO DE RESULTADOS ---
         st.markdown(f"### 📊 Resultado: {liga_sel} | {lado_sel} {linha_sel}")
+        st.markdown(f"*Análise consolidada de todas as temporadas disponíveis.*")
         
         total_jogos = len(df_filtrado)
         lucro_total = df_filtrado['PL'].sum()
@@ -168,16 +171,18 @@ if st.session_state.get('mostrar_resultados'):
         odd_media_total = df_filtrado[odd_col].mean()
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Volume", f"{total_jogos}")
+        c1.metric("Volume Total", f"{total_jogos}")
         c2.metric("Lucro Total", f"{lucro_total:.2f} u", delta_color="normal")
         c3.metric("ROI Global", f"{roi_total:.2f}%", delta=f"{roi_total:.2f}%")
         c4.metric("Odd Média", f"{odd_media_total:.2f}")
 
         st.divider()
 
-        # Tabela por Temporada
-        st.markdown("### 📅 Desempenho por Temporada")
+        # --- TABELA POR TEMPORADA (AQUI ESTÁ O QUE VOCÊ QUERIA) ---
+        st.markdown("### 📅 Detalhe por Temporada")
+        
         if 'Temporada' in df_filtrado.columns:
+            # Agrupamento para mostrar o detalhe
             resumo = df_filtrado.groupby('Temporada').agg(
                 Jogos=('PL', 'count'),
                 Lucro=('PL', 'sum'),
@@ -189,6 +194,8 @@ if st.session_state.get('mostrar_resultados'):
             resumo_show['ROI'] = (resumo_show['ROI'] * 100).round(2).astype(str) + '%'
             resumo_show['Lucro'] = resumo_show['Lucro'].round(2)
             resumo_show['Odd_Media'] = resumo_show['Odd_Media'].round(2)
+            
+            # Ordena da mais recente
             resumo_show = resumo_show.sort_values('Temporada', ascending=False)
 
             st.dataframe(
@@ -203,15 +210,16 @@ if st.session_state.get('mostrar_resultados'):
                     "Odd_Media": st.column_config.NumberColumn("Odd Média", format="%.2f")
                 }
             )
-        
+        else:
+            st.warning("Coluna 'Temporada' não encontrada para agrupamento.")
+
         st.divider()
         
-        # Gráfico
-        st.markdown("### 📈 Curva de Lucro")
-        fig = px.line(df_filtrado, x='Date', y='Lucro_Acumulado', height=400)
+        # --- GRÁFICO ---
+        st.markdown("### 📈 Curva de Lucro (Histórico Completo)")
+        fig = px.line(df_filtrado, x='Date', y='Lucro_Acumulado')
         fig.add_hline(y=0, line_dash="dash", line_color="red")
         st.plotly_chart(fig, use_container_width=True)
-
 else:
     if not btn_rodar:
-        st.info("👈 Selecione os filtros na barra lateral e clique em 'Rodar Análise'.")
+        st.info("👈 Selecione os parâmetros e clique em 'Rodar Análise'.")
